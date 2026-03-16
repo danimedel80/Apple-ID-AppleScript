@@ -28,8 +28,6 @@ end tell
 --TO DO:
 
 --write itunes running check
---write file output section for account status column
---write check for account status of "completed" or "skipped"
 
 --Global Vars
 
@@ -53,6 +51,14 @@ set scriptAction to "Continue"
 --Store the current user number (based off line number in CSV file)
 global currentUser
 set currentUserNumber to 0
+
+--Stores the path to the CSV file that was opened, used to write account statuses back after processing
+global csvFilePath
+set csvFilePath to ""
+
+--Stores the column index of the Account Status column in the source CSV file, used for write-back
+global accountStatusColumnIndex
+set accountStatusColumnIndex to 0
 
 
 -- UI location of HTML content container, which can change with iTunes versions. Set value after iTunes launch.
@@ -215,7 +221,7 @@ on MainMagic(userDroppedFile, droppedFile)
 			
 			--Ask user if they want to perform a dry run, and give them a chance to cancel
 			set scriptRunMode to button returned of (display dialog "Would you like to preform a ''dry run'' of the script?" & return & return & "A ''dry run'' will run through every step, EXCEPT actually creating the Apple IDs." buttons {"Actually Create New Apple IDs", "Dry Run", "Cancel"}) as text
-			if scriptRunMode is "Actually Ceate New Apple IDs" then set dryRun to false
+			if scriptRunMode is "Actually Create New Apple IDs" then set dryRun to false
 			if scriptRunMode is "Dry Run" then set dryRun to true
 			if scriptRunMode is "Cancel" then set scriptAction to "Abort"
 			
@@ -253,6 +259,14 @@ on MainMagic(userDroppedFile, droppedFile)
 					set phoneNumber to item loopCounter of phoneNumberColumnContents
 					set accountStatus to item loopCounter of accountStatusColumnContents
 					
+					-- Skip accounts that were already successfully processed in a previous run.
+					-- We still append the existing status to maintain index alignment with the CSV rows
+					-- so that WriteAccountStatuses can correctly update each row during write-back.
+					if accountStatus is "Created" or accountStatus is "Skipped" then
+						set accountStatusSetByCurrentRun to accountStatusSetByCurrentRun & accountStatus
+						log {"Skipping (already processed): ", appleIdEmail}
+					else
+					
 					delay masterDelay
 					
 					SignOutItunesAccount() ---------------------------------------------------------------------------------------------------------------------------------------------------------Signout Apple ID that is currently signed in (if any)
@@ -273,7 +287,7 @@ on MainMagic(userDroppedFile, droppedFile)
 					CheckForErrors() ------------------------------------------------------------------------------------------------------------------------------------------------------------------Checks for errors that may have been thrown by previous handler
 					if scriptAction is "Abort" then exit repeat -----------------------------------------------------------------------------------------------------------------------------------If an error was detected and the user chose to abort, then end the script
 					
-					ClickCreateNewAppleIDButton() -----------------------------------------------------------------------------------------------------------------------------------------------------Click "Ceate New Apple ID" button on pop-up window
+					ClickCreateNewAppleIDButton() -----------------------------------------------------------------------------------------------------------------------------------------------------Click "Create New Apple ID" button on pop-up window
 					ClickContinueOnPageOne() ------------------------------------------------------------------------------------------------------------------------------------------------------Click "Continue" on the page with the title "Welcome to the iTunes Store"
 					CheckForErrors() ------------------------------------------------------------------------------------------------------------------------------------------------------------------Checks for errors that may have been thrown by previous handler
 					if scriptAction is "Abort" then exit repeat -----------------------------------------------------------------------------------------------------------------------------------If an error was detected and the user chose to abort, then end the script
@@ -312,7 +326,14 @@ on MainMagic(userDroppedFile, droppedFile)
 					
 					if scriptAction is "Stop" then exit repeat
 					
+					end if -- end skip check
+					
 				end repeat
+				
+				-- Write the updated account statuses back to the CSV file so they are visible on the next run
+				if csvFilePath is not "" and accountStatusColumnIndex is not 0 then
+					WriteAccountStatuses(csvFilePath, accountStatusSetByCurrentRun, accountStatusColumnIndex)
+				end if
 				
 				--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------Display dialog boxes that confirm the exit status of the script
 				
@@ -393,6 +414,9 @@ on loadUsersFile(userDroppedFile, chosenFile)
 	
 	--Retrieve the contents of the found columns
 	if scriptAction is "Continue" then
+		-- Store the account status column index (item 21 in listOfColumnsToFind) for CSV write-back
+		set accountStatusColumnIndex to item 21 of findResults
+		
 		set fileContents to {}
 		repeat with contentRetrievalLoopCounter from 1 to (count of items in findResults)
 			set fileContents to fileContents & ""
@@ -575,6 +599,7 @@ on ReadCsvFile(chosenFile)
 		set testResult to TestCsvFile(chosenFile)
 		
 		if testResult is yes then
+			set csvFilePath to chosenFile -- Store file path globally for status write-back
 			set openFile to open for access chosenFile
 			set fileContents to read chosenFile
 			close access openFile
@@ -1262,3 +1287,72 @@ on ProvidePaymentDetails(userFirstName, userLastName, addressStreet, addressCity
 		end tell --End "System Events" tell
 	end if --End main error check IF
 end ProvidePaymentDetails
+
+-----------------------------------------
+
+-- Writes the updated account statuses back to the CSV file so they are visible on subsequent runs.
+-- filePath: alias to the CSV file that was read
+-- statusList: list of status strings ("Created", "Skipped", etc.) for each data row, in order
+-- statusColIndex: the column number (1-based) in the CSV that holds the Account Status value
+on WriteAccountStatuses(filePath, statusList, statusColIndex)
+	if (count of statusList) is 0 then return
+	set delimitersOnCall to AppleScript's text item delimiters
+	try
+		-- Re-read the file to get the latest contents
+		set openFile to open for access filePath
+		set fileContents to read filePath
+		close access openFile
+		
+		-- Parse the file into a list of rows (each row is a list of field values).
+		-- Note: this uses a simple comma delimiter and does not handle quoted fields containing
+		-- commas, consistent with how ParseCsvFile works elsewhere in this script.
+		set AppleScript's text item delimiters to ","
+		set parsedRows to {}
+		set lineCount to count of paragraphs in fileContents
+		repeat with i from 1 to lineCount
+			set parsedRows to parsedRows & 1
+			set item i of parsedRows to (every text item of paragraph i of fileContents)
+		end repeat
+		
+		-- Update the status column in each data row (row 1 is the header, data starts at row 2)
+		repeat with i from 1 to (count of statusList)
+			set rowIndex to i + 1
+			if rowIndex <= (count of parsedRows) then
+				if statusColIndex <= (count of item rowIndex of parsedRows) then
+					set item statusColIndex of item rowIndex of parsedRows to item i of statusList
+				end if
+			end if
+		end repeat
+		
+		-- Rebuild the CSV text from the updated rows
+		set newContents to ""
+		repeat with i from 1 to (count of parsedRows)
+			set currentRow to item i of parsedRows
+			set rowText to ""
+			repeat with j from 1 to (count of currentRow)
+				if j > 1 then set rowText to rowText & ","
+				set rowText to rowText & item j of currentRow
+			end repeat
+			if i < (count of parsedRows) then
+				set newContents to newContents & rowText & return
+			else
+				set newContents to newContents & rowText
+			end if
+		end repeat
+		
+		set AppleScript's text item delimiters to delimitersOnCall
+		
+		-- Write the updated contents back to the file
+		set openFile to open for access filePath with write permission
+		set eof of openFile to 0
+		write newContents to openFile
+		close access openFile
+		
+	on error theError
+		try
+			close access filePath
+		end try
+		set AppleScript's text item delimiters to delimitersOnCall
+		display dialog "Unable to write account status back to the CSV file." & return & return & theError buttons {"OK"}
+	end try
+end WriteAccountStatuses
